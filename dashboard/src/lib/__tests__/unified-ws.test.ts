@@ -116,8 +116,11 @@ async function flushMicrotasks(): Promise<void> {
   }
 }
 
+let activeClients: (typeof UnifiedWsClientType)[] = []
+
 async function loadClient(): Promise<typeof UnifiedWsClientType> {
   const module = await import('../unified-ws')
+  activeClients.push(module.unifiedWsClient)
   return module.unifiedWsClient
 }
 
@@ -148,6 +151,8 @@ describe('unifiedWsClient', () => {
   })
 
   afterEach(() => {
+    activeClients.forEach((c) => c.disconnect())
+    activeClients = []
     vi.unstubAllGlobals()
     vi.useRealTimers()
   })
@@ -701,5 +706,44 @@ describe('unifiedWsClient', () => {
     await vi.advanceTimersByTimeAsync(1000)
     await flushMicrotasks()
     expect(console.error).toHaveBeenCalledWith('统一 WebSocket 重连失败:', expect.any(Error))
+  })
+
+  it('握手超时（20s）主动关闭 socket 并拒绝连接', async () => {
+    const client = await loadClient()
+    const connectPromise = client.connect()
+    const expectation = expect(connectPromise).rejects.toThrow('统一 WebSocket 连接超时')
+    await flushMicrotasks()
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    const socket = FakeWebSocket.instances[0]
+    expect(socket.readyState).toBe(FakeWebSocket.CONNECTING)
+
+    // 前进 20 秒触发超时
+    await vi.advanceTimersByTimeAsync(20000)
+    await expectation
+    expect(socket.readyState).toBe(FakeWebSocket.CLOSED)
+  })
+
+  it('获取 token 失败时自动调度下一次重连', async () => {
+    apiState.tokenError = new Error('网络错误')
+    const client = await loadClient()
+    await expect(client.connect()).rejects.toThrow('无法建立统一 WebSocket 连接')
+    expect(FakeWebSocket.instances).toHaveLength(0)
+
+    // Token 恢复后，重连定时器自动生效建立连接
+    apiState.tokenError = null
+    await vi.advanceTimersByTimeAsync(1000)
+    await flushMicrotasks()
+    expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('浏览器 online 事件触发断线重连', async () => {
+    const { client, socket } = await connectAndOpen()
+    socket.serverClose(1006)
+    expect(client.getStatus()).toBe('idle')
+
+    // 模拟 online 事件触发即时恢复
+    window.dispatchEvent(new Event('online'))
+    await flushMicrotasks()
+    expect(FakeWebSocket.instances).toHaveLength(2)
   })
 })

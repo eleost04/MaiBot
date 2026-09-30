@@ -92,6 +92,44 @@ class UnifiedWebSocketClient {
   private subscriptions: Map<string, SubscriptionDefinition> = new Map()
   private ws: WebSocket | null = null
 
+  private watchingBrowser = false
+
+  private readonly onResume = () => {
+    if (this.manualDisconnect || !this.hasConnectedOnce) return
+    if (this.ws?.readyState === WebSocket.OPEN && Date.now() - this.lastPongAt < 45000) {
+      return
+    }
+    void this.restart().catch((error) => {
+      console.error('统一 WebSocket 恢复连接失败:', error)
+    })
+  }
+
+  private readonly onVisibilityChange = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+      this.onResume()
+    }
+  }
+
+  private watchBrowser(): void {
+    if (this.watchingBrowser || typeof window === 'undefined') return
+    this.watchingBrowser = true
+    window.addEventListener('online', this.onResume)
+    window.addEventListener('pageshow', this.onResume)
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this.onVisibilityChange)
+    }
+  }
+
+  private unwatchBrowser(): void {
+    if (!this.watchingBrowser || typeof window === 'undefined') return
+    this.watchingBrowser = false
+    window.removeEventListener('online', this.onResume)
+    window.removeEventListener('pageshow', this.onResume)
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange)
+    }
+  }
+
   private getReconnectDelay(): number {
     const baseDelay = getSetting('wsReconnectInterval')
     return Math.min(baseDelay * Math.max(this.reconnectAttempts, 1), 30000)
@@ -339,12 +377,14 @@ class UnifiedWebSocketClient {
     }
 
     this.manualDisconnect = false
+    this.watchBrowser()
     this.setStatus('connecting')
 
     this.connectPromise = (async () => {
       const wsUrl = await this.createWebSocketUrl()
       if (!wsUrl) {
         this.setStatus('idle')
+        this.scheduleReconnect()
         throw new Error('无法建立统一 WebSocket 连接')
       }
 
@@ -353,7 +393,16 @@ class UnifiedWebSocketClient {
         const socket = new WebSocket(wsUrl)
         this.ws = socket
 
+        const connectTimeout = window.setTimeout(() => {
+          if (!settled) {
+            settled = true
+            socket.close()
+            reject(new Error('统一 WebSocket 连接超时'))
+          }
+        }, 20000)
+
         socket.onopen = () => {
+          clearTimeout(connectTimeout)
           if (this.ws !== socket) {
             socket.close()
             return
@@ -375,6 +424,7 @@ class UnifiedWebSocketClient {
         }
 
         socket.onerror = () => {
+          clearTimeout(connectTimeout)
           if (this.ws !== socket) {
             return
           }
@@ -386,6 +436,7 @@ class UnifiedWebSocketClient {
         }
 
         socket.onclose = (event) => {
+          clearTimeout(connectTimeout)
           if (!settled) {
             settled = true
             reject(new Error(`统一 WebSocket 已关闭 (${event.code})`))
@@ -406,6 +457,7 @@ class UnifiedWebSocketClient {
 
   disconnect(): void {
     this.manualDisconnect = true
+    this.unwatchBrowser()
     this.clearReconnectTimer()
     this.stopHeartbeat()
     this.lastPongAt = 0
@@ -422,6 +474,9 @@ class UnifiedWebSocketClient {
     this.manualDisconnect = false
     this.clearReconnectTimer()
     if (this.ws) {
+      if (this.connectPromise) {
+        this.connectPromise.catch(() => {})
+      }
       this.ws.close()
       return
     }
